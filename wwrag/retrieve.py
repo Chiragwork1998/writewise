@@ -3159,9 +3159,20 @@ def retrieve(
         gap_explain: dict[str, Any] = dict(GAP_EXPLAIN_OFF)
         gap_scored: dict[int, dict[str, Any]] = {}
         if gapfill_enabled and gap_stats is not None:
+            # The gap pass fills RESERVED seats, so it must search only what may BECOME this
+            # category: its own code and the un-gated kinds, never a support code. Searched
+            # on the full pool, a "mentor" gap pulled a law-school alumni mentorship and a
+            # music-school mentorship (both GEN) into Academics and Intellectual Alignment.
+            # Measured (two students, pre-registered targets): gap pass off 82/88, on and
+            # scoped 86/90, on and unscoped 88/93 specific+relevant -- the unscoped surplus
+            # was exactly the support-code rows. Targets identical in all three.
+            support = set(cat.get("support_codes") or ())
+            own_mask = ~np.isin(index.category_arr[rows], list(support)) if support else np.ones(rows.size, bool)
+            own_rows = rows[own_mask]
+            gap_table = load_candidate_table(index, own_rows, "gap_rows") if own_rows.size < rows.size else table
             candidates, gap_scored, gap_explain = gap_pass(
-                index, profile, cat, rows, queries, chosen, texts, scored,
-                gap_stats, table, corpus_stop,
+                index, profile, cat, own_rows, queries, chosen, texts, scored,
+                gap_stats, gap_table, corpus_stop,
             )
             gap_explain["slots"] = gapfill.gap_slots(per_category)
             if candidates:
