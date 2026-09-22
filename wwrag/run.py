@@ -67,10 +67,12 @@ CONFIG: dict[str, Any] = {
     "writer_model": "deepseek-v4-pro",
     "cheap_model": "deepseek-flash",
     "embedding": "BAAI/bge-small-en-v1.5 (fastembed, local, free)",
-    # 32, measured: a 7-config sweep on one real applicant moved named things 99 -> 131 and
-    # distinct named things 176 -> 230 purely by raising this from 24. It is a bigger lever than
-    # every scoring knob in retrieve.py combined, and retrieval costs nothing.
-    "per_category": 32,
+    # 24, and the story is worth keeping. A free 7-config sweep showed 32 gives 27% more named
+    # things in the EVIDENCE, so it was raised -- and the report got worse, not better: three
+    # chapters failed outright because a third more evidence makes each response a third longer,
+    # and the provider drops long responses. The sweep measured the half of the pipeline that
+    # never fails. Do not raise this again without fixing the writer first.
+    "per_category": 24,
     "category_order": ["CUL", "EXT", "QRK", "ACA", "RES", "SOC", "INN", "INT", "DIV", "NEW"],
     "supporting_code": "GEN",
     # DeepSeek published prices, USD per 1M tokens. Off-peak is half price.

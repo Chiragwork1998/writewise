@@ -750,6 +750,9 @@ def test_evidence_unit_contract(course_index):
         "source_kind",
         "year",
         "score",
+        # why this row is in the section; a reserved-slot row keeps the front of it
+        "selected_because",
+        "anchor_for",
         "retrieval",
     }
     index = retrieve.CollegeIndex(course_index / "alpha")
@@ -776,9 +779,19 @@ def test_scores_are_sorted_and_deterministic(course_index):
         first, _ = retrieve.retrieve(index, profile(), per_category=5, embedder=StubEmbedder())
         second, _ = retrieve.retrieve(index, profile(), per_category=5, embedder=StubEmbedder())
         assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+        # The section is no longer sorted by score alone. Rows seated by the reserved-query-slot
+        # pass keep the front, because that pass exists precisely to rescue rows the fused score
+        # discards -- and sorting the whole section by that score put them straight back at the
+        # bottom (a declared field's rank-1 match was handed to the writer as item 17 of 24).
+        # What must still hold: the REST is score-ordered, and two runs agree exactly.
         for units in first.values():
-            scores = [u["score"] for u in units]
-            assert scores == sorted(scores, reverse=True)
+            def is_reserved(u):
+                return "query slot" in str(u.get("selected_because") or "")
+            reserved = [u for u in units if is_reserved(u)]
+            rest = [u["score"] for u in units if not is_reserved(u)]
+            assert rest == sorted(rest, reverse=True), "non-reserved rows must be score-ordered"
+            if reserved:
+                assert units.index(reserved[0]) < len(units), "reserved rows sit at the front"
     finally:
         index.close()
 

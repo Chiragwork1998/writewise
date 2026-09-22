@@ -145,6 +145,20 @@ CONFIG: dict[str, Any] = {
     "profile_list_cap": 8,
     # per-query candidate depth for each half
     "vector_top_k": 80,
+    # For every kind a category has a floor for, how many rows of that kind each query is
+    # guaranteed in its vector list before fusion. See apply_kind_quota().
+    "kind_quota_per_query": 6,
+    # ANCHOR PASS. For each of the student's most substantive artefacts -- a paper, a founded
+    # organisation, an internship -- the single closest things at the college, found by running
+    # the artefact ITSELF as the query, unblended. See anchor_pass().
+    "anchor_artefacts": 6,        # the student's most substantive lines (by length, not recurrence)
+    "anchor_min_words": 12,       # a prize line is not an artefact; a described piece of work is
+    "anchor_duplicate_sim": 0.80, # the same paper listed as project AND achievement is one artefact
+    "anchor_per_query": 3,        # candidates per (artefact, frame); the best joins then compete
+    "anchor_min_sim": 0.45,       # measured: every lexical coincidence sat at <= 0.43, every real join >= 0.46
+    "anchor_min_hit_words": 8,    # "X is an alumni mentor" is not an anchor; a described fact is
+    "anchor_max_per_chapter": 4,
+    "anchor_max_total": 10,
     "keyword_top_k": 80,
     "fts_overfetch": 4,  # ask FTS for k*this before trimming: cheap insurance against ties
     # OWN-CODE QUOTA. A category's pool is its own fact codes PLUS its support codes PLUS every
@@ -160,6 +174,12 @@ CONFIG: dict[str, Any] = {
     "own_code_top_k": 80,  # depth of the own-code-only pass
     # fusion
     "rrf_k": 60,
+    # How much a unit's score may come from queries OTHER than its best one. See fuse().
+    "fusion_agreement_weight": 0.20,
+    # A field the student (or their counsellor) DECLARED is the authoritative brief for the whole
+    # report. A scraped hobby list is not. They carried identical query weight, so "Gender Studies"
+    # and "Lawn Tennis, Oil painting, Basketball, Golf" were worth the same vote.
+    "declared_field_boost": 2.0,
     "vector_weight": 1.0,
     "keyword_weight": 1.0,
     "bm25_column_weights": (1.0, 1.5),  # keyword_text, entity_name
@@ -449,7 +469,14 @@ CATEGORIES: tuple[dict[str, Any], ...] = (
         "query_lead": "student",
         "query_weights": {"intent": 0.75, "student": 1.00},
         "kind_weights": {"fact": 1.00, "chunk": 0.90, "course": 1.08},
-        "kind_floor": {"course": 3},
+        # A share of the section, not a count. Academics IS the course list, and an absolute
+        # floor of 3 was the same trap Extracurriculars was in with clubs: 3 of 24 slots for
+        # the one kind of thing the chapter exists to name, the other 21 to prose about degree
+        # requirements. Raising the club floor to half the section took named clubs per student
+        # from 5 to 14 -- the largest single gain measured on this pipeline.
+        # Measured on two students: 0.25 seats 6 of 24 and loses nothing; 0.4 seats 10 but drops
+        # a declared-field degree fact (the rank pass shrinks from 11 picks to 4).
+        "kind_floor": {"course": 0.25},
         "source_kind_weights": {"official": 1.05, "affiliated": 1.00, "external": 0.92},
         "recency": True,
         "org_fit_key": None,
@@ -471,6 +498,13 @@ CATEGORIES: tuple[dict[str, Any], ...] = (
         "query_lead": "student",
         "query_weights": {"intent": 0.55, "student": 1.00},
         "kind_weights": {"fact": 1.00, "chunk": 0.92, "course": 0.95, "org": 0.95},
+        # TRIED AND REVERTED: an entity-type floor of 0.3 for professor/person/lab/center.
+        # Measured on two applicants it cost one of them three named targets (SURF and the Min
+        # Family Challenge -- programmes, displaced by seven lab seats) and gained the other
+        # nothing, because the economist she needed is not a graph node at all: 35% of graph
+        # nodes have no edges and many people are missing outright. A type floor can only seat
+        # what the graph has typed. Research needs its people found by the student's queries
+        # (see reserved seats), not reserved by type.
         "kind_floor": {},
         "source_kind_weights": {"official": 1.05, "affiliated": 1.02, "external": 0.92},
         "recency": True,
@@ -554,7 +588,10 @@ CATEGORIES: tuple[dict[str, Any], ...] = (
         "name": "Diversity of Community",
         "fact_codes": ("DIV",),
         "support_codes": ("GEN", "CUL"),
-        "kinds": ("fact", "chunk", "org"),
+        # courses too: a gender-and-sexuality department is mostly COURSES, and
+        # excluding that kind hid 49 of its 59 units from this chapter before
+        # any search ran.
+        "kinds": ("fact", "chunk", "org", "course"),
         "intents": (
             "support for international students and students from different backgrounds",
             "cultural centers, affinity groups and first-generation student support",
@@ -644,7 +681,21 @@ PROCESS_BOILERPLATE = re.compile(
     r"|advising appointment|degree progress|transcript request|d-?clearance"
     r"|registration (?:process|period|opens)|best source for|refer to the"
     r"|see the catalogu?e|for more information|learn more about"
-    r"|the page lists|this page (?:lists|shows|contains))\b", re.I)
+    r"|the page lists|this page (?:lists|shows|contains)"
+    # sentences that assert a listing exists and name nothing inside it
+    r"|the program offers (?:student organi[sz]ations|undergraduate research)"
+    r"|has student-run clubs|are listed as (?:a resource|other resources)"
+    r"|may hire undergraduates as research assistants)\b", re.I)
+
+# A line that is a piece of intellectual work -- the only kind a faculty search makes sense for.
+# Genre words, not subject words: a paper, a study, a seminar; never "economics" or "AI".
+RESEARCH_MARKER = re.compile(
+    r"\b(?:paper|published|publication|research|study|studies|conference|journal|presented|"
+    r"seminars?|thesis|experiment|analysis|survey|abstract|findings|hypothesis|dataset)\b", re.I)
+
+PERSON_MARKER = re.compile(
+    r"\b(?:professor|Professor|researcher|economist|scientist|Dr\.|PhD|Ph\.D)\b"
+    r"|\b(?:conducts|researches|studies|investigates|examines|directs|leads)\b")
 
 COURSE_CODE_RE = re.compile(r"\b([A-Za-z]{2,5})\s*[-– ]?\s*(\d{3,5}[A-Za-z]?)\b")
 WORD_RE = re.compile(r"[A-Za-z0-9']+")
@@ -1000,6 +1051,62 @@ class CollegeIndex:
             if PROCESS_BOILERPLATE.search(r[1] or "")
         }
 
+        # What kind of thing each unit's entity is, from the graph (professor, lab, org...), so a
+        # category can reserve seats for a TYPE of entity -- Research for people and labs -- the
+        # way Academics does for courses and Extracurriculars for clubs. Empty when the index has
+        # no graph; nothing below depends on it being present.
+        self.entity_type: list[str] = [""] * n
+        self.foreign_institution: set[int] = set()
+        self.home_institution: set[str] = set()
+        try:
+            own = {r[0] for r in self.conn.execute(
+                "SELECT name_key FROM graph_nodes WHERE type = 'university' "
+                "ORDER BY degree DESC LIMIT 3")}
+            self.home_institution = set(own)
+            foreign = {r[0] for r in self.conn.execute(
+                "SELECT name_key FROM graph_nodes WHERE type = 'university'")} - own
+            type_of: dict[str, str] = {}
+            for name_key, typ in self.conn.execute("SELECT name_key, type FROM graph_nodes"):
+                type_of.setdefault(name_key, typ)
+            for i, name in enumerate(self.entity_name):
+                if not name:
+                    continue
+                k = str(name).strip().lower()
+                self.entity_type[i] = type_of.get(k, "")
+                # A fact whose subject is another university is in this index by accident of the
+                # crawl (a professor's previous employer, a news comparison). It must never take a
+                # reserved seat: one about the University of Michigan did, in a real report.
+                if k in foreign:
+                    self.foreign_institution.add(i)
+        except Exception:  # noqa: BLE001 - no graph, no types; floors on types simply find nothing
+            pass
+
+        # Facts that describe a PERSON'S research or role -- the rows an "anchor" search for
+        # faculty runs against. Marked by the grammar of such a sentence, never by a name.
+        by_grammar = {int(r[0]) for r in self.conn.execute(
+            "SELECT vec_row, text FROM units WHERE kind = 'fact'")
+            if PERSON_MARKER.search(r[1] or "")}
+        by_graph: set[int] = set()
+        graph_people: set[int] = set()
+        try:  # the graph sharpens both masks; an index without one still gets the grammar
+            by_graph = {int(r[0]) for r in self.conn.execute(
+                "SELECT u.vec_row FROM units u JOIN graph_nodes g ON lower(u.entity_name) = g.name_key "
+                "WHERE u.kind = 'fact' AND g.type IN ('person', 'professor')")}
+            graph_people = {int(r[0]) for r in self.conn.execute(
+                "SELECT u.vec_row FROM units u JOIN graph_nodes g ON lower(u.entity_name) = g.name_key "
+                "WHERE g.type IN ('person', 'professor', 'university')")}
+        except Exception:  # noqa: BLE001
+            pass
+        self.person_rows: np.ndarray = np.array(sorted(by_grammar | by_graph), dtype=np.int64)
+        # rows that NAME a thing -- an anchor hit must be nameable or the writer cannot use it.
+        # People belong to the faculty search above; the college itself names nothing.
+        self.nameable_rows: np.ndarray = np.array(sorted(
+            int(r[0]) for r in self.conn.execute(
+                "SELECT vec_row, entity_name FROM units WHERE kind IN ('org', 'course') "
+                "OR (entity_name IS NOT NULL AND entity_name <> '')")
+            if int(r[0]) not in graph_people
+            and str(r[1] or "").strip().lower() not in self.home_institution), dtype=np.int64)
+
         # How many hostnames this college publishes on. One means a per-hostname cap cannot
         # discriminate between sites and must not be applied.
         self.distinct_hosts = len({h for h in self.source_host if h})
@@ -1009,6 +1116,7 @@ class CollegeIndex:
         )
 
         self.kind_arr = np.array(self.kind, dtype=object)
+        self.entity_type_arr = np.array(self.entity_type, dtype=object)
         self.category_arr = np.array([c or "" for c in self.category_code], dtype=object)
         self.source_kind_arr = np.array(self.source_kind, dtype=object)
 
@@ -1572,6 +1680,12 @@ def plan_queries(
             # this category's own balance -- and carried by a flag, not by sniffing the facet
             # label, because "intended_fields" is a student facet whose name starts like "intent"
             weight = intent_weight if is_intent else student_weight
+            # A DECLARED field outweighs a scraped hobby list. Both were student facets carrying
+            # the same weight, so an applicant's stated subject competed on equal terms with
+            # "Lawn Tennis, Oil painting, Basketball, Golf" -- and lost, because six off-topic
+            # queries agree with each other and one on-topic query agrees with nobody.
+            if facet.startswith("intended_fields"):
+                weight *= float(CONFIG["declared_field_boost"])
             queries.append(
                 Query(f"{code}-q{len(queries) + 1}", code, facet, text, keyword_text or text, weight)
             )
@@ -1641,7 +1755,10 @@ def candidate_rows(
             # whole course pool is a bundle whose flag we could not read, and it is invisible
             # downstream -- the category just comes back as prose and nobody knows a kind floor
             # went unmet. Warn on the way past, every time, for all 45 colleges.
-            floor = int((category.get("kind_floor") or {}).get("course") or 0)
+            raw_floor = float((category.get("kind_floor") or {}).get("course") or 0)
+            # int(0.4) is 0, which silenced this warning the moment the floor became a share of
+            # the section. The section size is not known here, so name the share as written.
+            floor = raw_floor
             detail = (
                 f"category {category['code']}: the undergraduate gate removed ALL "
                 f"{courses_before:,} candidate courses (none flagged undergraduate, or all read "
@@ -2048,11 +2165,12 @@ def apply_own_code_quota(
 
 
 class Hit:
-    __slots__ = ("vec_row", "rrf", "best_vector", "best_keyword", "queries")
+    __slots__ = ("vec_row", "rrf", "best_vector", "best_keyword", "queries", "parts")
 
     def __init__(self, vec_row: int) -> None:
         self.vec_row = vec_row
         self.rrf = 0.0
+        self.parts: list[float] = []
         self.best_vector = 0.0
         self.best_keyword = 0.0
         self.queries: dict[str, dict[str, Any]] = {}
@@ -2062,6 +2180,228 @@ class Hit:
         entry[f"{half}_rank"] = rank
         entry[f"{half}_score"] = round(raw, 6)
 
+
+def rows_of_kind(index: CollegeIndex, rows: np.ndarray, kind: str) -> np.ndarray:
+    """The subset of `rows` a floor key describes: a unit kind, or "entity:<type,type>"."""
+    if kind.startswith("entity:"):
+        types = {t.strip() for t in kind[len("entity:"):].split(",") if t.strip()}
+        return rows[np.isin(index.entity_type_arr[rows], list(types))]
+    return rows[index.kind_arr[rows] == kind]
+
+
+def row_is_kind(index: CollegeIndex, vec_row: int, kind: str) -> bool:
+    if kind.startswith("entity:"):
+        types = {t.strip() for t in kind[len("entity:"):].split(",") if t.strip()}
+        return index.entity_type[vec_row] in types
+    return index.kind[vec_row] == kind
+
+
+def apply_kind_quota(
+    index: CollegeIndex,
+    category: dict[str, Any],
+    rows: np.ndarray,
+    query_vecs: np.ndarray,
+    vector_hits: list[list[tuple[int, float]]],
+    queries: Sequence["Query"] | None = None,
+) -> tuple[list[list[tuple[int, float]]], dict[str, Any]]:
+    """A kind the category has a floor for is guaranteed rows in each query's list BEFORE fusion.
+
+    A floor can only seat rows that were fetched, and each query keeps its top 80. For an
+    applicant who declared Economics, the query "Economics for undergraduates: undergraduate
+    courses, majors and degree requirements" ranked the economics COURSES at #146-169 -- behind
+    about 140 facts ABOUT the major ("learning objectives include ...") -- so not one economics
+    course was ever in the pool, and the course floor had nothing to seat. Prose about a subject
+    always outscores the subject's own catalogue entries on a query that uses the prose's words.
+
+    So each floored kind gets its own exact search over just its rows, and its best few rows are
+    merged into every query's list that lacks them. Courses compete with courses for the floor.
+    Same mechanism as the own-code quota above it, for the same reason. Generic: any kind, any
+    college, any student.
+    """
+    floors = category.get("kind_floor") or {}
+    info: dict[str, Any] = {}
+    if not floors or rows.size == 0 or not len(vector_hits):
+        return vector_hits, info
+    quota = int(CONFIG["kind_quota_per_query"])
+    v_k = int(CONFIG["vector_top_k"])
+    for kind in floors:
+        kind_rows = rows_of_kind(index, rows, kind)
+        if kind_rows.size == 0:
+            info[kind] = {"rows": 0, "queries_topped_up": 0}
+            continue
+        kind_set = set(kind_rows.tolist())
+        short = [i for i, hits in enumerate(vector_hits)
+                 if sum(1 for r, _ in hits if r in kind_set) < quota]
+        if not short:
+            info[kind] = {"rows": int(kind_rows.size), "queries_topped_up": 0}
+            continue
+        kind_hits = vector_search(index, kind_rows, query_vecs, quota)
+        vector_hits = [
+            merge_with_own_quota(hits, kind_hits[i], kind_set, v_k, quota, descending=True)
+            if i in short else hits
+            for i, hits in enumerate(vector_hits)
+        ]
+        # The order the floor should seat this kind in: by the STUDENT'S questions, never the
+        # category's generic intent. Fused order is led by the intent query, and for Research
+        # that query loves any lab page saying "welcomes undergraduates" -- a floor walking fused
+        # order seated a yeast lab, a materials lab and a software lab for an AI-and-finance
+        # applicant, displacing the programmes he had. Type says what may sit here; the
+        # student's own words say who.
+        student_cols = [i for i, q in enumerate(queries or [])
+                        if not (q.facet == "intent" or q.facet.startswith("intent:"))]
+        cols = student_cols if student_cols else list(range(int(query_vecs.shape[0])))
+        sims = np.asarray(index.vectors[kind_rows], dtype=np.float32) @ query_vecs[cols].T
+        best = sims.max(axis=1)
+        order = np.argsort(-best, kind="stable")
+        info[kind] = {"rows": int(kind_rows.size), "queries_topped_up": len(short),
+                      "ordered": [int(kind_rows[i]) for i in order[: 4 * quota * max(1, len(cols))]]}
+    return vector_hits, info
+
+
+def anchor_artefacts(profile: dict[str, Any], embedder: Any) -> list[tuple[str, np.ndarray]]:
+    """The student's most substantive lines: a described piece of work, not a prize line.
+
+    Ordered by length within facet weight (a project outranks an activity outranks an award),
+    never by recurrence -- recurrence is what made three small quiz prizes outrank one published
+    paper. The same work listed twice (paper as project AND as achievement) is merged by embedding.
+    """
+    facets = profile_facets(profile)
+    min_words = int(CONFIG["anchor_min_words"])
+    cands: list[tuple[float, str]] = []
+    for facet in ("projects", "activities", "achievements"):
+        w = float(FACET_EVIDENCE_WEIGHT.get(facet, 0.5))
+        for v in facets.get(facet) or []:
+            n = len(v.split())
+            if n >= min_words:
+                cands.append((w * min(n, 40), v))
+    cands.sort(key=lambda t: -t[0])
+    if not cands:
+        return []
+    texts = [v for _, v in cands]
+    vecs = embedder.embed_queries(texts)
+    dup = float(CONFIG["anchor_duplicate_sim"])
+    keep: list[tuple[str, np.ndarray]] = []
+    for text, vec in zip(texts, vecs):
+        if any(float(vec @ kv) >= dup for _, kv in keep):
+            continue
+        keep.append((text, vec))
+        if len(keep) >= int(CONFIG["anchor_artefacts"]):
+            break
+    return keep
+
+
+def anchor_pass(
+    index: CollegeIndex,
+    profile: dict[str, Any],
+    embedder: Any,
+    results: dict[str, list[dict[str, Any]]],
+    per_category: int,
+) -> list[dict[str, Any]]:
+    """What a counsellor does first: take one thing the student DID and find its closest match.
+
+    Every chapter blends ~8 questions, and blending is exactly what buries the person-level
+    match. A published paper on the economic cost of menopause, run through Research as one of
+    eight facets, lost to a dementia-cost study; run on its own, framed as a faculty search in the
+    student's declared fields and restricted to rows about people, its top hits were a labour
+    economist who studies violence against women and the professor whose college description is
+    "how our health interacts with the labor economy". An e-waste venture, run on its own, found
+    the college's monthly e-waste drive at #1. Neither reached any chapter through the blend.
+
+    So: each substantive artefact is run VERBATIM, twice -- once against rows that name a thing,
+    once against rows about people, framed as a faculty search in the declared fields -- and the
+    best joins across all artefacts compete for a capped number of seats at the front of the
+    chapter their kind belongs to, each carrying the line of the file it answers to. Chapters do
+    not grow: an anchor replaces the weakest blended row. Generic in every part: the frame words
+    come from the student's own declared fields, and it costs only the embeddings.
+    """
+    out: list[dict[str, Any]] = []
+    if embedder is None or index.n_units == 0 or not results:
+        return out
+    artefacts = anchor_artefacts(profile, embedder)
+    if not artefacts:
+        return out
+    fields = [str(x) for x in (profile.get("declared_fields") or profile.get("intended_fields") or []) if x]
+    frame = "faculty whose research is on" + (" " + ", ".join(fields[:4]) if fields else "") + ": "
+    person_rows = getattr(index, "person_rows", np.array([], dtype=np.int64))
+    nameable = getattr(index, "nameable_rows", np.array([], dtype=np.int64))
+    if not nameable.size:
+        nameable = np.arange(index.n_units, dtype=np.int64)
+    k = int(CONFIG["anchor_per_query"])
+    min_sim = float(CONFIG["anchor_min_sim"])
+    skip = index.process_boilerplate | index.foreign_institution
+
+    # Per artefact, per frame, the ranked candidates. Seats are then given ROUND-ROBIN in order
+    # of substance: every artefact's best join first, then the seconds. Never by a global score
+    # -- similarity is not comparable across artefacts (a short generic line scores 0.54
+    # against "X is an alumni mentor"; a paper's true faculty match scores 0.45).
+    ranked: list[tuple[str, str, list[tuple[int, float]]]] = []
+    research = [t for t, _ in artefacts if RESEARCH_MARKER.search(t)]
+    framed = dict(zip(research, embedder.embed_queries([frame + t for t in research]))) \
+        if research and person_rows.size else {}
+    # Faculty joins first, for every research artefact, then the named-thing joins: a person
+    # whose research is the student's research is the most valuable seat a chapter has.
+    for text, vec in artefacts:
+        if text in framed:
+            ranked.append((text, "faculty whose research is closest to this",
+                           [(int(r), float(x)) for r, x in
+                            vector_search(index, person_rows, framed[text].reshape(1, -1), k)[0]]))
+    for text, vec in artefacts:
+        ranked.append((text, "closest named thing at the college to this",
+                       [(int(r), float(x)) for r, x in vector_search(index, nameable, vec.reshape(1, -1), k)[0]]))
+    min_hit_words = int(CONFIG["anchor_min_hit_words"])
+
+    cur = index.conn.cursor()
+    cur.row_factory = sqlite3.Row
+    seen: set[int] = set()
+    seen_entities: set[str] = set()
+    per_chapter: dict[str, int] = {}     # doubles as the next seat: anchors keep their seating order
+    max_chapter = int(CONFIG["anchor_max_per_chapter"])
+    max_total = int(CONFIG["anchor_max_total"])
+    for rnd in range(k):
+        for art, why, hits in ranked:
+            if len(out) >= max_total:
+                return out
+            # one seat per (artefact, frame) per round: the first hit not yet considered
+            for vec_row, sim in hits:
+                if sim < min_sim or vec_row in seen or vec_row in skip:
+                    continue
+                kind = index.kind[vec_row]
+                if why.startswith("faculty"):
+                    code = "RES"
+                elif kind == "org":
+                    code = "EXT"
+                elif kind == "course":
+                    code = "ACA"
+                else:
+                    code = index.category_code[vec_row] or ""
+                if code not in results or per_chapter.get(code, 0) >= max_chapter:
+                    seen.add(vec_row)
+                    continue
+                row = cur.execute("SELECT * FROM units WHERE vec_row = ?", (int(vec_row),)).fetchone()
+                seen.add(vec_row)
+                if row is None or len(str(row["text"] or "").split()) < min_hit_words:
+                    continue
+                ekey = (row["entity_name"] or "").strip().lower()
+                if ekey and ekey in seen_entities:   # one seat per named thing
+                    continue
+                if ekey:
+                    seen_entities.add(ekey)
+                per_chapter[code] = per_chapter.get(code, 0) + 1
+                hit = Hit(int(vec_row)); hit.best_vector = sim; hit.rrf = sim; hit.parts = [sim]
+                entry = {"hit": hit, "score": sim,
+                         "selected_because": f"anchor ({why}): {art[:70]}", "anchor_for": art}
+                unit = evidence_unit(index, int(vec_row), entry, row)
+                chapter = results[code]
+                present = next((j for j, u in enumerate(chapter) if u["unit_id"] == unit["unit_id"]), None)
+                if present is not None:
+                    chapter.pop(present)          # already there: promote it, now carrying its artefact
+                elif len(chapter) >= per_category:
+                    chapter.pop()                 # chapters do not grow: the weakest blended row yields
+                chapter.insert(per_chapter[code] - 1, unit)
+                out.append({"artefact": art[:90], "unit_id": unit["unit_id"], "chapter": code,
+                            "sim": round(sim, 3), "why": why, "promoted": present is not None})
+                break
+    return out
 
 def fuse(
     vector_hits: list[list[tuple[int, float]]],
@@ -2077,15 +2417,40 @@ def fuse(
     for qi, query in enumerate(queries):
         for rank, (vec_row, sim) in enumerate(vector_hits[qi], start=1):
             hit = hits.setdefault(vec_row, Hit(vec_row))
-            hit.rrf += query.weight * vw / (k + rank)
+            hit.parts.append(query.weight * vw / (k + rank))
             hit.best_vector = max(hit.best_vector, sim)
             hit.note(query.qid, "vector", rank, sim)
         for rank, (vec_row, bm25) in enumerate(keyword_hits[qi], start=1):
             hit = hits.setdefault(vec_row, Hit(vec_row))
-            hit.rrf += query.weight * kw / (k + rank)
+            hit.parts.append(query.weight * kw / (k + rank))
             # bm25() is negative and smaller is better; report it as a positive "how strong"
             hit.best_keyword = max(hit.best_keyword, -bm25)
             hit.note(query.qid, "keyword", rank, -bm25)
+
+    # AGREEMENT IS A TIE-BREAKER, NOT THE SIGNAL.
+    #
+    # Plain Reciprocal Rank Fusion sums 1/(k+rank) over every query. With k=60 the gap between
+    # being a query's #1 and its #50 is only 1.8x, while eight queries mildly agreeing multiplies
+    # by eight. The arithmetic therefore says eight shrugs beat one emphatic yes: a unit ranked
+    # #1 by one query and ignored by seven scores 0.0164, and a bland unit ranked #50 by all
+    # eight scores 0.0727 -- the bland one wins by 4.4x.
+    #
+    # That is not a tuning problem, it is the shape of the sum, and lowering k does not fix it:
+    # even at k=5 breadth still wins. It is why a Gender Studies applicant's own department never
+    # reached her report while "the university has student organizations." did, and why the best
+    # matching AI society in the corpus lost to generic club prose for an AI applicant. Only one
+    # or two of a student's eight queries ever ask about what makes them unusual.
+    #
+    # So score each unit by its BEST single query, and let the rest contribute a fraction. The
+    # question becomes "how well did the best question match this?" rather than "how many
+    # questions had a mild opinion?". alpha=0 would ignore corroboration entirely; alpha=1 is the
+    # old behaviour.
+    alpha = float(CONFIG["fusion_agreement_weight"])
+    for hit in hits.values():
+        if not hit.parts:
+            continue
+        best = max(hit.parts)
+        hit.rrf = best + alpha * (sum(hit.parts) - best)
 
     return hits
 
@@ -2182,22 +2547,33 @@ def dedupe_key(text: str) -> str:
     …/researchandinnovation/x), which gives two units with different ids, different page ids and
     identical prose. Without this they take two slots and the report says the same thing twice.
     """
-    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()[:200]
+    key = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+    # A cross-listed course is served under two codes with identical prose (PSYC 210 / POSC 210,
+    # ENST 150 / IR 150). Keyed on the full text they took two seats and said the same thing
+    # twice -- three of ten course seats in one real chapter. The code is not the course.
+    key = re.sub(r"^[a-z]{2,5} ?\d{3,5}[a-z]? ?", "", key)
+    return key[:200]
 
 
-def reserved_by_rank(vhits: Sequence[Sequence[tuple]], depth: int) -> list[int]:
+def reserved_by_rank(vhits: Sequence[Sequence[tuple]], depth: int,
+                     skip: set[int] | frozenset[int] = frozenset()) -> list[int]:
     """Each query's top `depth` vector hits, interleaved: all the #1s, then all the #2s.
 
     Breadth before depth, so a query with a weak leader still gets its best row seated, and no
     single query can take two slots before another has taken one.
     """
+    # A seat is reserved because the fused score is known to discard a query's best answer.
+    # It must not be spent on filler: "The page lists an Undergraduate section." was a query's
+    # #1 vector hit and took a reserved seat in a real report. Each query's list is walked past
+    # anything in `skip` to its best hit that actually says something.
+    usable = [[int(r) for r, _ in hits if int(r) not in skip] for hits in vhits]
     out: list[int] = []
     seen: set[int] = set()
     for rank in range(max(1, depth)):
-        for hits in vhits:
+        for hits in usable:
             if rank >= len(hits):
                 continue
-            row = int(hits[rank][0])
+            row = hits[rank]
             if row not in seen:
                 seen.add(row)
                 out.append(row)
@@ -2212,6 +2588,7 @@ def select_units(
     gap_candidates: Sequence[dict[str, Any]] | None = None,
     gap_scored: dict[int, dict[str, Any]] | None = None,
     query_best: Sequence[int] | None = None,
+    kind_order: dict[str, Sequence[int]] | None = None,
 ) -> tuple[list[int], list[dict[str, Any]], dict[int, sqlite3.Row]]:
     """Greedy top-down pick, subject to per-page, per-entity, per-host, per-kind and
     supporting-code caps.
@@ -2296,7 +2673,7 @@ def select_units(
     support_used = 0
     drops: list[dict[str, Any]] = []
 
-    def blocked_by(vec_row: int) -> str | None:
+    def blocked_by(vec_row: int, seating_floor: bool = False) -> str | None:
         row = texts.get(vec_row)
         if row is not None:
             key = dedupe_key(row["text"])
@@ -2309,7 +2686,12 @@ def select_units(
         if entity_count.get(entity, 0) >= max_entity:
             return f"entity cap ({max_entity}) for {entity}"
         host = index.source_host[vec_row]
-        if host_count.get(host, 0) >= max_host:
+        # The host cap stops one SITE dominating a chapter. A kind floor is a deliberate
+        # reservation for one kind of thing, and every course at a college is published on a
+        # single host -- the catalogue -- so the cap silently limited every course floor to four,
+        # whatever the floor said. Four separate floor implementations measured zero gain before
+        # this was found. Seating a floor bypasses the host cap; nothing else does.
+        if not seating_floor and host_count.get(host, 0) >= max_host:
             return f"host cap ({max_host}) for {host}"
         kind = index.kind[vec_row]
         if kind in max_kind and kind_count.get(kind, 0) >= max_kind[kind]:
@@ -2383,6 +2765,7 @@ def select_units(
     # Bounded and safe: at most one row per query, never more than a third of the section, each
     # still passes every cap in blocked_by, and the fused ordering below is untouched.
     query_taken = 0
+    reserved_rows: list[int] = []
     if query_best:
         max_query_slots = max(1, (per_category * int(CONFIG["query_slot_depth"])) // 3)
         for vec_row in query_best:
@@ -2394,6 +2777,7 @@ def select_units(
             if blocked_by(vec_row):
                 continue
             take(vec_row, "query slot: this query's strongest hit")
+            reserved_rows.append(vec_row)
             query_taken += 1
 
     # pass 1: kind floors
@@ -2403,15 +2787,18 @@ def select_units(
         # error" at 60, and it cannot be right at both.
         floor = max(1, round(float(floor) * per_category)) if 0 < float(floor) < 1 else int(floor)
         taken = 0
-        for vec_row, _ in ranked:
+        preferred = [int(r) for r in (kind_order or {}).get(kind, []) if int(r) in scored]
+        seen_pref = set(preferred)
+        candidates = preferred + [r for r, _ in ranked if r not in seen_pref]
+        for vec_row in candidates:
             if taken >= floor or len(chosen) >= per_category:
                 break
-            if vec_row in chosen_set or index.kind[vec_row] != kind:
+            if vec_row in chosen_set or not row_is_kind(index, vec_row, kind):
                 continue
             # blocked_by carries the fit gate: the floor is here to stop a fit-keyed category
             # coming back as twelve prose facts, NOT to promise clubs at any price. An unmet
             # floor is honest; a wrong club is not.
-            if blocked_by(vec_row):
+            if blocked_by(vec_row, seating_floor=True):
                 continue
             take(vec_row, f"kind floor: {kind}")
             taken += 1
@@ -2442,7 +2829,15 @@ def select_units(
         take(vec_row, "rank")
 
     # keep the final list in score order even after the kind-floor and gap passes jumped the queue
-    chosen.sort(key=lambda r: (-entry_for(r)["score"], index.unit_id[r]))
+    # RESCUED, THEN BURIED. Pass 0b seats each query's strongest hit precisely because the fused
+    # score is known to discard it -- and then this sort put it back where the fused score said it
+    # belonged. Measured on a real applicant: her declared field's best match, rank 1 of 89,181
+    # rows at cosine 0.657, was correctly reserved and then handed to the writer as evidence item
+    # 17 of 24. The rescue worked and the sort undid it. Reserved rows keep the front of the
+    # section, in the order they were seated; everything else sorts by score as before.
+    reserved = {r: i for i, r in enumerate(reserved_rows)}
+    chosen.sort(key=lambda r: (0, reserved[r]) if r in reserved
+                else (1, -entry_for(r)["score"]))
     return chosen, drops, texts
 
 
@@ -2469,6 +2864,13 @@ def evidence_unit(
         "source_kind": index.source_kind[vec_row],
         "year": year if year > 0 else None,
         "score": round(float(entry["score"]), 6),
+        # Why this row is here. A row seated by the reserved-query-slot pass is the single best
+        # answer to one of the questions the student's own profile raised, and it keeps the front
+        # of the section -- the fused score is exactly what would have discarded it.
+        "selected_because": str(entry.get("selected_because") or ""),
+        # For an anchor row: the exact line of the student's file this is the closest thing to.
+        # The writer gets the pair, so "take your survey data to Barcellos" can be written.
+        "anchor_for": str(entry.get("anchor_for") or ""),
         "retrieval": {
             "vector": round(float(hit.best_vector), 6),
             "keyword": round(float(hit.best_keyword), 6),
@@ -2728,6 +3130,10 @@ def retrieve(
         vhits, khits, quota_info = apply_own_code_quota(
             index, cat, rows, own_rows, block, queries, vhits, khits
         )
+        # and the kinds this chapter exists to name -- courses for Academics, clubs for
+        # Extracurriculars -- are guaranteed a place in the lists too, or the floor is empty
+        vhits, kind_quota_info = apply_kind_quota(index, cat, rows, block, vhits, queries)
+        kind_order = {k: v.get("ordered", []) for k, v in kind_quota_info.items()}
 
         hits = fuse(vhits, khits, queries)
         if not hits:
@@ -2743,9 +3149,10 @@ def retrieve(
         # organisation in the whole corpus at #2 and a sentence saying a page HAS a club list at
         # #1, so the reserved slot went to the sentence and the organisation was never seen.
         # Interleaving by rank keeps breadth first and still reaches past a weak leader.
-        query_best = reserved_by_rank(vhits, int(CONFIG["query_slot_depth"]))
+        query_best = reserved_by_rank(vhits, int(CONFIG["query_slot_depth"]),
+                                      skip=index.process_boilerplate | index.foreign_institution)
         chosen, drops, texts = select_units(index, cat, scored, per_category,
-                                            query_best=query_best)
+                                            query_best=query_best, kind_order=kind_order)
 
         # SECOND PASS. What did this category miss? Same rows, same temp table, BM25 only.
         t0 = time.time()
@@ -2760,7 +3167,7 @@ def retrieve(
             if candidates:
                 chosen, drops, texts = select_units(
                     index, cat, scored, per_category, candidates, gap_scored,
-                    query_best=query_best,
+                    query_best=query_best, kind_order=kind_order,
                 )
                 gap_explain["filled"] = sum(
                     1
@@ -2869,6 +3276,11 @@ def retrieve(
             f"That is a wrong index or a category vocabulary that does not match it, not a "
             f"thin college -- refusing to hand generation an empty evidence set."
         )
+    # LAST: the person-level joins, unblended, seated at the front of their chapters
+    explain["anchors"] = anchor_pass(index, profile, embedder, results, per_category)
+    if explain["anchors"]:
+        log(f"  anchors: {len(explain['anchors'])} seated -- "
+            + "; ".join(f"{a['chapter']}: {a['artefact'][:34]}" for a in explain["anchors"][:4]))
     return results, explain
 
 

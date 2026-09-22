@@ -354,6 +354,11 @@ def render_units(units: list[dict[str, Any]], undergraduate: bool, max_chars: in
             meta.append(f"year={defang(unit['year'])}")
         if meta:
             parts.append("META: " + " ".join(meta))
+        if unit.get("anchor_for"):
+            # the counsellor's move, handed over as a pair: this thing, for that line of the file
+            parts.append("ANCHOR: this is the closest thing at the college to this line in the "
+                         f"student's own file -- \"{defang(clip(str(unit['anchor_for']), 220))}\". "
+                         "Use both halves: name the thing, and say what the student would do with it.")
         if unit.get("entity_name"):
             parts.append(f"ABOUT: {defang(clip(str(unit['entity_name']), 200))}")
         if unit.get("text"):

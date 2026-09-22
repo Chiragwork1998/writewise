@@ -30,7 +30,7 @@ args = ap.parse_args()
 college = Path(args.college)
 slug = college.name
 SCHEMA = "2.0"
-VERSION = "v2"
+VERSION = "v3"
 out = college / "export" / f"{slug}_rag_{VERSION}"
 if out.exists():
     shutil.rmtree(out)

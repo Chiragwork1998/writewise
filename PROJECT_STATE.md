@@ -243,3 +243,58 @@ before each one.
 
 Test suite: 166 passing (`test_gapfill.py` still excluded — its fixture no longer reproduces a
 gap, because first-pass retrieval improved).
+
+## 10. Evening of 22 September 2026 — the anchor pass (commit `0ed2861`)
+
+**The problem, in one line.** Every chapter blends ~8 questions about the student, and blending
+is exactly what buries the one match a counsellor makes first: *this paper → that professor;
+this venture → that campus programme.* Aadya's published paper on the economic cost of
+menopause, blended into Research as one facet of eight, lost to a dementia-cost study. Aashrut's
+Greenbyte e-waste venture never reached any chapter, though the college's monthly e-waste drive
+sat in the index at #1 for it.
+
+**What was built.** `retrieve.anchor_pass()` runs after the chapters are filled:
+
+1. `anchor_artefacts()` picks the student's most substantive lines — by length within facet
+   weight (project > activity > award), duplicates merged by embedding, **never by recurrence**
+   (recurrence is what put three small quiz prizes above one published paper). A line under 12
+   words is a prize line, not an artefact.
+2. Each artefact is run verbatim, unblended: once against rows that **name a thing** (org,
+   course, or a fact with an entity — people and the college itself excluded), and, for lines
+   that are research by genre (paper/study/seminar…), once against rows **about people**
+   (grammar mask ∪ graph person/professor nodes) framed as
+   `faculty whose research is on <declared fields>: <line>`. The frame words come from the
+   client's declared major — the one place the product already tells us the subject. No
+   hand-written topic words anywhere.
+3. Seats: round-robin per artefact (similarity is not comparable across artefacts — a generic
+   "alumni relations" line scores 0.54 against "X is an alumni mentor"; a paper's true faculty
+   match scores 0.45), faculty joins first, one per named thing, hit must be ≥ 8 words, at most
+   4 per chapter / 10 total, minimum similarity 0.45 (measured: every lexical coincidence sat at
+   ≤ 0.43, every real join ≥ 0.46). Chapters do not grow — the weakest blended row yields.
+4. Every anchored unit carries `anchor_for` = the student's own line, and `generate.py`
+   renders the pair (`ANCHOR: this is the closest thing at the college to this line…`) so the
+   writer can say what the student would *do* with it.
+
+**Measured (free probes, both students, per_category 24).**
+
+| | Aadya (Gender Studies + Economics) | Aashrut (AI, CS, Finance) |
+|---|---|---|
+| Faculty joins seated | Emily Nix (labour economist, violence against women) ← menopause paper; Mohammed Alyakoob and Stephanie Tully ← digital-security/consumer-spending paper; Rhacel Parreñas (directs the Gender Studies seminar) ← The Third Eye seminars | Jinchi Lv, Lou (AI-investment study) ← PLS-SEM investor paper; IHP Lab ← IEEE paper |
+| Thing joins seated | USC Math Club, SDA student-alumni mentorship, CAIS++ | Sustainability Hub e-waste + E-Waste Wednesday ← Greenbyte; STEM Day of Discovery, SEEDS ← STEM mentoring; "Bitcoin and AI" programme ← paper |
+| Pre-registered targets | 9/22 → 9/22 (the counsellors' three names — Barcellos, Angrisani, CESR — are not reached: Barcellos has one fact in the index and ranks #14 for the paper; Nix/Parreñas are my own judgement, not theirs) | 12/20 → 12/20 with course floor 0.25 (+ Sustainability Hub e-waste, + CSBA degree; nothing lost) |
+
+Also in the commit: ACA course floor 0.4 → 0.25 (0.4 dropped Aashrut's declared-field degree
+fact; 0.25 loses nothing — confirmed independently by the fix workflow), the person/nameable
+masks work on an index without a graph, and the college's own name leaves the anchor pool.
+Tests: 186 passing (+1 anchor regression test on the stub index).
+
+**Honest limits.** The pass works well for research artefacts and distinctive ventures, and
+weakly for generic role lines (student council, club president): the embedding matches the
+role language, not the substance, which is why CAIS++ was seated for a maths-society
+presidency. The 0.45 floor is a property of this embedder (text-embedding-3-large, 1536 d);
+a different model needs re-measuring. Gap-fill still searches the category's full pool, so
+"mentor" can pull mentorship programmes into ACA/RES — not yet fixed.
+
+**Runs.** `wwrag/runs/anchor1/` — Aadya (declared Gender Studies + Economics; PDF published as
+the next `deliverables/Aadya_Aggarwal_USC_v<N>.pdf`) then Aashrut (declared AI, CS, Finance;
+chat review only), launched 18:49.

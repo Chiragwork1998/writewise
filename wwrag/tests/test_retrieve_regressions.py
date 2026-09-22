@@ -130,7 +130,11 @@ def test_emptying_the_whole_course_pool_is_loud_not_silent(tmp_path, capsys):
         said = capsys.readouterr().out
         assert rows.size == 0
         assert "WARNING" in said and "removed ALL" in said, said
-        assert "floor of 3" in said, "the unmet course floor was not named"
+        # the floor is whatever the CATEGORIES table says (now a share of the section); the
+        # warning must name it, whatever it is, rather than a number frozen in this test
+        aca = retrieve.CATEGORY_BY_CODE["ACA"]
+        want = f"floor of {float(aca['kind_floor']['course'])}"
+        assert want in said, f"the unmet course floor was not named: wanted {want!r}"
         assert warnings and warnings[0]["category_code"] == "ACA"
         assert warnings[0]["candidates_before_gate"] == 4
     finally:
@@ -688,18 +692,36 @@ def test_the_measured_balance_reaches_the_planned_queries(tmp_path):
     plans = retrieve.plan_queries(profile())
     for code, queries in plans.items():
         cat = retrieve.CATEGORY_BY_CODE[code]
-        intent = [q for q in queries if q.facet.startswith("intent")]
-        student = [q for q in queries if not q.facet.startswith("intent")]
+        # "intended_fields".startswith("intent") is True, which is precisely the trap the
+        # comment in plan_queries warns about. Match the whole label, not a prefix.
+        def is_intent(q):
+            return q.facet == "intent" or q.facet.startswith("intent:")
+        intent = [q for q in queries if is_intent(q)]
+        student = [q for q in queries if not is_intent(q)]
         assert intent, code
         assert all(q.weight == pytest.approx(cat["query_weights"]["intent"]) for q in intent), code
-        assert all(q.weight == pytest.approx(cat["query_weights"]["student"]) for q in student), code
+        # A DECLARED field is the client's authoritative brief and now outweighs the rest of the
+        # student's facets. It used to carry the same weight as a scraped hobby list, and lost:
+        # six off-topic queries agree with each other, one on-topic query agrees with nobody.
+        base = cat["query_weights"]["student"]
+        boost = retrieve.CONFIG["declared_field_boost"]
+        for q in student:
+            want = base * boost if q.facet.startswith("intended_fields") else base
+            assert q.weight == pytest.approx(want), f"{code} {q.facet}"
 
     # the two widest margins in the table, in opposite directions
-    assert max(q.weight for q in plans["RES"] if not q.facet.startswith("intent")) > max(
-        q.weight for q in plans["RES"] if q.facet.startswith("intent")
+    def _is_intent(q):
+        return q.facet == "intent" or q.facet.startswith("intent:")
+    assert max(q.weight for q in plans["RES"] if not _is_intent(q)) > max(
+        q.weight for q in plans["RES"] if _is_intent(q)
     )
-    assert max(q.weight for q in plans["DIV"] if q.facet.startswith("intent")) > max(
-        q.weight for q in plans["DIV"] if not q.facet.startswith("intent")
+    # DIV is category-led: its own lens outweighs the student's ORDINARY facets. A declared
+    # field is excluded from the comparison because it is not an ordinary facet -- it is the
+    # client's authoritative brief, and it is meant to outrank the lens.
+    def _ordinary_student(q):
+        return not _is_intent(q) and not q.facet.startswith("intended_fields")
+    assert max(q.weight for q in plans["DIV"] if _is_intent(q)) > max(
+        q.weight for q in plans["DIV"] if _ordinary_student(q)
     )
 
 
@@ -864,3 +886,84 @@ def test_facet_ranker_falls_back_rather_than_failing():
     ranker = retrieve.FacetRanker(Broken(), {"activities": ["a b c", "d e f"]}, [soc])
     assert ranker.rank(["a b c", "d e f"], soc) is None
     assert retrieve.rank_for_category(["a b c", "d e f"], soc, 1, ranker) == ["a b c"]
+
+
+# --------------------------------------------------------------------------------------
+# the anchor pass: one thing the student DID, run on its own, seated with its artefact
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def anchor_index(tmp_path):
+    """A professor whose research IS the student's paper, a campus thing that IS the
+    student's venture, a six-word fact that overlaps the file but says nothing, and filler."""
+    from wwrag.tests.test_retrieve import unit, write_index
+
+    units = [
+        unit("alpha-fact-prof", "fact",
+             "Professor Ada Lovelace researches the economic cost of menopause productivity loss "
+             "among working women.",
+             category_code="RES", entity_name="Ada Lovelace",
+             source_url="https://example.edu/econ/lovelace"),
+        unit("alpha-fact-hub", "fact",
+             "The Campus Sustainability Hub collected 4,000 pounds of e-waste from homes in its "
+             "first e-waste management and awareness drive.",
+             category_code="SOC", entity_name="Campus Sustainability Hub",
+             source_url="https://example.edu/sustainability/hub"),
+        unit("alpha-fact-thin", "fact", "Ravi Kumar is an alumni mentor.",
+             category_code="EXT", entity_name="Ravi Kumar",
+             source_url="https://example.edu/alumni/mentors"),
+    ]
+    for code in ("RES", "SOC", "EXT", "ACA", "CUL"):
+        for i in range(4):
+            units.append(unit(f"alpha-fact-{code.lower()}-{i}", "fact",
+                              f"Filler sentence number {i} for the {code} category about campus life "
+                              f"and programs that every student can join here.",
+                              category_code=code, entity_name=f"Thing {code} {i}",
+                              source_url=f"https://example.edu/{code.lower()}/{i}"))
+    return write_index(tmp_path / "index", "alpha", units)
+
+
+def test_anchor_pass_seats_the_person_level_join_with_its_artefact(anchor_index):
+    from wwrag.tests.test_retrieve import StubEmbedder, profile
+
+    index = retrieve.CollegeIndex(anchor_index)
+    saved = dict(retrieve.CONFIG)
+    retrieve.CONFIG["anchor_min_sim"] = 0.2   # the stub embedder is bag-of-words; test the mechanism
+    try:
+        paper = ("Economic cost of menopause-related productivity loss published in a journal: "
+                 "the estimated economic cost of menopause productivity loss among working women")
+        venture = ("Greenbyte Founder led a large-scale e-waste management and awareness initiative "
+                   "collecting e-waste from homes and schools")
+        council = "Student Council Head of Alumni Relations connected with each alumni mentor for students"
+        prof = profile(projects=[paper], activities=[venture, council],
+                       achievements=["Quiz: 1st place: school science quiz"],
+                       intended_fields=["Economics"])
+        artefacts = [t for t, _ in retrieve.anchor_artefacts(prof, StubEmbedder())]
+        assert paper in artefacts and venture in artefacts
+        assert not any(a.startswith("Quiz") for a in artefacts), "a prize line is not an artefact"
+
+        results, explain = retrieve.retrieve(index, prof, per_category=4, embedder=StubEmbedder())
+        anchors = explain["anchors"]
+        assert anchors, "no anchor seated"
+        by_unit = {a["unit_id"]: a for a in anchors}
+        assert by_unit["alpha-fact-prof"]["chapter"] == "RES"
+        assert by_unit["alpha-fact-prof"]["why"].startswith("faculty")
+        assert by_unit["alpha-fact-hub"]["chapter"] == "SOC"
+        assert "alpha-fact-thin" not in by_unit, "a six-word fact is not an anchor"
+
+        # the faculty join is seated FIRST, carrying the line of the file it answers to
+        assert results["RES"][0]["unit_id"] == "alpha-fact-prof"
+        assert results["RES"][0]["anchor_for"] == paper
+        hub = next(u for u in results["SOC"] if u["unit_id"] == "alpha-fact-hub")
+        assert hub["anchor_for"] in artefacts
+        # anchors keep their seating order: every anchored row precedes every blended row
+        for units in results.values():
+            flags = [bool(u["anchor_for"]) for u in units]
+            assert flags == sorted(flags, reverse=True), flags
+        # and chapters did not grow
+        assert all(len(v) <= 4 for v in results.values())
+        assert all("anchor_for" in u for units in results.values() for u in units)
+    finally:
+        retrieve.CONFIG.clear(); retrieve.CONFIG.update(saved)
+        index.close()

@@ -38,11 +38,38 @@ from `generate` reuses the profile and the retrieval, which are already paid for
 | Stage | File | What it does |
 |---|---|---|
 | profile | `wwrag/profile.py` | CV -> structured JSON. Every item must quote the CV **verbatim** or it is dropped |
-| retrieve | `wwrag/retrieve.py` | Picks ~32 evidence units per chapter out of 165,056. Dense vectors + keyword search, fused |
+| retrieve | `wwrag/retrieve.py` | Picks 24 evidence units per chapter out of 165,056. Dense vectors + keyword search, fused; then the **anchor pass** seats the person-level joins at the front (see below) |
 | generate | `wwrag/generate.py` | Writes the ten chapters, one model call each |
 | verify | `wwrag/verify.py` | Re-checks every sentence against its cited quote. Deletes what it cannot prove |
 | useful | `wwrag/useful.py` | Deletes sentences that are true but say nothing |
 | report | `wwrag/report.py` | Markdown -> HTML -> PDF |
+
+## The anchor pass — the one thing a counsellor does first
+
+Blending ~8 questions per chapter is what buries the match a counsellor makes first: *this
+paper → that professor; this venture → that campus programme.* So after the chapters are
+filled, `retrieve.anchor_pass()` takes the student's most substantive lines (`anchor_artefacts()`:
+by length within facet weight, duplicates merged by embedding — never by how often a word
+recurs) and runs each one **verbatim, unblended**:
+
+- against rows that **name a thing** (org, course, or a fact with an entity; people and the
+  college itself excluded) — "closest named thing at the college to this";
+- for lines that are research by genre (paper / study / seminar…), against rows **about
+  people** (grammar mask ∪ graph person/professor nodes), framed as
+  `faculty whose research is on <declared fields>: <line>`. The subject words come from the
+  client's declared major. Never type subject words into the code.
+
+Seats are given round-robin per artefact (similarity is not comparable across artefacts),
+faculty joins first, one per named thing, hit ≥ 8 words, ≤ 4 per chapter / 10 total, similarity
+≥ 0.45 (measured for text-embedding-3-large: coincidences ≤ 0.43, real joins ≥ 0.46 — re-measure
+if the embedder changes). Chapters do not grow: the weakest blended row yields. Every anchored
+unit carries `anchor_for` = the student's own line, and `generate.py` renders the pair so the
+writer can say what the student would *do* with it. All knobs are `anchor_*` in `CONFIG`; the
+regression test is `test_anchor_pass_seats_the_person_level_join_with_its_artefact`.
+
+Where it is weak: generic role lines (student council, club president) match role language,
+not substance. Do not fix that by adding names or subjects — fix the artefact picker or the
+frame, and measure on both students.
 
 ## The five things that will bite you
 
@@ -82,6 +109,9 @@ Everything below came from an A/B, and the numbers are in the code comments next
 | Org floor 0.5 in Extracurriculars | Named clubs 5 -> 14 per student | `retrieve.py` EXT `kind_floor` |
 | Reserved slots deeper than rank 1 | **Worse** (24 -> 23 on-target). Reverted | `retrieve.py query_slot_depth` |
 | 3 ranked facet items instead of 2 | **No gain** (137 -> 136). Reverted | `retrieve.py` |
+| Anchor pass (person-level join) | Papers -> the right faculty (Nix, Parreñas, Alyakoob, Tully, Lv, Lou); Greenbyte -> Sustainability Hub e-waste (+1 target); nothing lost | `retrieve.py anchor_*` |
+| Anchor seats by global similarity | **Worse**: generic lines at 0.54 crowd out a paper's 0.45 faculty join. Replaced by round-robin per artefact | `retrieve.py anchor_pass` |
+| ACA course floor 0.4 -> 0.25 | 0.4 dropped a declared-field degree fact; 0.25 loses nothing (confirmed twice) | `retrieve.py` ACA `kind_floor` |
 
 Two of those are recorded reverts. Keep doing that — a change that did not help is worth
 writing down so nobody tries it again.
