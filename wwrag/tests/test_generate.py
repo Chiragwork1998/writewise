@@ -75,3 +75,20 @@ def test_genuinely_empty_prose_is_still_caught():
               "There are lots of opportunities here.",
               "The page lists an Undergraduate section."]:
         assert not generate.names_a_findable_thing(t), t
+
+
+
+def test_no_real_students_artefacts_in_the_prompt_text():
+    """The prompt is generic. An example drawn from a real applicant's file leaked into that
+    applicant's report almost verbatim ("bring your ... collection logistics and corporate-office
+    pickup routes to the Hub's ..."). Markers below are artefacts of real files this pipeline
+    was tuned on; none may appear in anything the model reads."""
+    from wwrag import generate
+    prompt = generate.category_system_prompt(
+        "RES", "Research", "Example University", "undergraduate",
+        items_min=1, items_max=3, body_min=80) if "body_min" in generate.category_system_prompt.__code__.co_varnames \
+        else generate.category_system_prompt("RES", "Research", "Example University", "undergraduate", 1, 3, 80)
+    blob = str(prompt).lower()
+    for marker in ("e-waste", "greenbyte", "menopause", "rowing", "sustainability hub", "emily nix",
+                   "1,300 kg", "corporate-office", "aadya", "aashrut"):
+        assert marker not in blob, f"real-student marker {marker!r} is in the writer prompt"
