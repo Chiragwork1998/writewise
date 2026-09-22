@@ -279,6 +279,35 @@ def flatten_evidence(evidence_path: Path, flat_path: Path) -> dict[str, Any]:
     # saying "this exists" is not the same as "you may have this", and the verification gate
     # only ever checked the first. Life stage is filtered (a pre-college course is not open
     # to an enrolled undergraduate); citizenship is never inferred, only reported.
+    # Add the entity graph's relationships as evidence, HERE at the seam rather than inside
+    # the writer, so the writer and the verifier see exactly the same units. Expanding inside
+    # generate.py alone would let it cite a relation that never reached evidence_units.json,
+    # and every such citation would look fabricated to the verifier and be deleted.
+    graph_stats: dict[str, Any] = {"available": False, "reason": "no index passed"}
+    if GRAPH_INDEX_DIR.get("path"):
+        try:
+            sys.path.insert(0, str(HERE))
+            import graph as _graph
+
+            buckets, graph_stats = _graph.expand_evidence(
+                Path(GRAPH_INDEX_DIR["path"]), buckets, GRAPH_INDEX_DIR.get("college_id", ""),
+                level=APPLICANT.get("level") or "undergraduate",
+            )
+            if graph_stats.get("available"):
+                log(f"    graph: +{graph_stats['relations_added']} relation units "
+                    f"{graph_stats['by_category']}")
+                if graph_stats.get("wrong_level_dropped"):
+                    log(f"    graph: dropped {len(graph_stats['wrong_level_dropped'])} relation(s) "
+                        f"naming a course of the wrong level: "
+                        + ", ".join(d["entity"][:40] for d in graph_stats["wrong_level_dropped"][:4]))
+            else:
+                log(f"    graph: not used ({graph_stats.get('reason')})")
+        except Exception as exc:  # noqa: BLE001 - enrichment must never fail a paid run
+            log(f"    graph: skipped after an error ({exc})")
+            graph_stats = {"available": False, "reason": str(exc)}
+
+    # The level gate runs AFTER the graph, so a relation's sentence is judged like any other
+    # unit. Before, relation units skipped it: a graduate course reached an undergraduate report.
     try:
         sys.path.insert(0, str(HERE))
         import eligibility as _elig
@@ -293,27 +322,6 @@ def flatten_evidence(evidence_path: Path, flat_path: Path) -> dict[str, Any]:
             f"material is NOT being filtered or flagged in this run")
         elig_stats = {"error": f"{type(exc).__name__}: {exc}", "available": False}
 
-    # Add the entity graph's relationships as evidence, HERE at the seam rather than inside
-    # the writer, so the writer and the verifier see exactly the same units. Expanding inside
-    # generate.py alone would let it cite a relation that never reached evidence_units.json,
-    # and every such citation would look fabricated to the verifier and be deleted.
-    graph_stats: dict[str, Any] = {"available": False, "reason": "no index passed"}
-    if GRAPH_INDEX_DIR.get("path"):
-        try:
-            sys.path.insert(0, str(HERE))
-            import graph as _graph
-
-            buckets, graph_stats = _graph.expand_evidence(
-                Path(GRAPH_INDEX_DIR["path"]), buckets, GRAPH_INDEX_DIR.get("college_id", "")
-            )
-            if graph_stats.get("available"):
-                log(f"    graph: +{graph_stats['relations_added']} relation units "
-                    f"{graph_stats['by_category']}")
-            else:
-                log(f"    graph: not used ({graph_stats.get('reason')})")
-        except Exception as exc:  # noqa: BLE001 - enrichment must never fail a paid run
-            log(f"    graph: skipped after an error ({exc})")
-            graph_stats = {"available": False, "reason": str(exc)}
         # persist the expanded evidence so generate.py reads the same set
         data_out = dict(data)
         if isinstance(data_out.get("evidence"), dict):

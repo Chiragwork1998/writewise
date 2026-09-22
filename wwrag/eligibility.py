@@ -55,7 +55,9 @@ RESTRICTIONS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "graduate_only",
         "The source describes this as being for graduate students.",
         re.compile(r"\b(graduate students only|open (?:only )?to graduate students"
-                   r"|master'?s or doctoral students|PhD students only)\b", re.I),
+                   r"|master'?s or doctoral students|PhD students only"
+                   # "Writing for Economics Master's Students": a stated graduate audience
+                   r"|(?:for|to) (?:\w+ )?(?:master['’]?s|mba|doctoral|ph\.?d\.?) students)\b", re.I),
     ),
     (
         "transfer_only",
@@ -102,8 +104,12 @@ def wrong_for_level(unit: dict[str, Any], level: str) -> str | None:
     bad = WRONG_FOR_LEVEL.get((level or "undergraduate").lower(), ())
     if not bad:
         return None
+    blob = unit_text(unit)
     for r in restrictions_for(unit):
         if r["key"] in bad:
+            # conservative: graduate-only wording that ALSO says undergraduate is not a bar
+            if r["key"] == "graduate_only" and re.search(r"\bundergrad", blob, re.I):
+                continue
             return r["key"]
     return None
 

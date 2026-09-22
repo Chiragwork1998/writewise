@@ -573,14 +573,54 @@ def chains_to_units(chains_by_unit: dict[str, list[dict[str, Any]]],
     return list(out.values())
 
 
+def _flag(value: Any) -> bool | None:
+    """A bundle's boolean however it spelled it; None when unreadable or not stated."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    v = str(value).strip().lower()
+    if v in ("1", "true", "yes", "y", "t"):
+        return True
+    if v in ("0", "false", "no", "n", "f"):
+        return False
+    return None
+
+
+def course_is_undergraduate(conn: sqlite3.Connection, entity: str) -> bool | None:
+    """The index's own level flag for the course a relation names, or None if it has none.
+
+    A relation is one sentence -- "Emily Nix teaches GSBA 511" -- and says nothing about who
+    may take the course. The course unit it points at does (extra.is_undergraduate), and for
+    an undergraduate applicant a graduate course is not evidence, however good the professor.
+    """
+    key = (entity or "").strip().lower()
+    if not key:
+        return None
+    m = re.match(r"([a-z]{2,5})\s*[-– ]?\s*(\d{3,5}[a-z]?)\b", key)
+    code_like = f"{m.group(1)} {m.group(2)}%" if m else None
+    rows = conn.execute(
+        "SELECT json_extract(extra, '$.is_undergraduate') FROM units WHERE kind = 'course' "
+        "AND (lower(entity_name) = ? OR lower(entity_name) LIKE ? OR lower(text) LIKE ?) LIMIT 4",
+        (key, code_like or key, (code_like or key).replace(" ", "%", 1) if code_like else key),
+    ).fetchall()
+    flags = [_flag(r[0]) for r in rows]
+    flags = [f for f in flags if f is not None]
+    if not flags:
+        return None
+    return any(flags)
+
+
 def expand_evidence(index_dir: Path, buckets: dict[str, list[dict[str, Any]]],
-                    college_id: str = "", cfg: dict[str, Any] | None = None
+                    college_id: str = "", cfg: dict[str, Any] | None = None,
+                    level: str | None = None,
                     ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Add relation units to each category's evidence. Returns (buckets, stats).
 
     A category gets the chains hanging off its OWN units, so a relation only appears where
     the thing it relates was already judged relevant. No category gains evidence about
-    something it never retrieved.
+    something it never retrieved. With `level`, a relation that names a course the index
+    flags as the wrong level for that applicant is dropped, and the drop is counted.
     """
     cfg = cfg or CONFIG
     db = Path(index_dir) / "chunks.sqlite"
@@ -593,6 +633,7 @@ def expand_evidence(index_dir: Path, buckets: dict[str, list[dict[str, Any]]],
         out: dict[str, list[dict[str, Any]]] = {}
         added_total = 0
         per_cat: dict[str, int] = {}
+        wrong_level: list[dict[str, str]] = []
         for code, units in buckets.items():
             if not isinstance(units, list):
                 out[code] = units
@@ -601,6 +642,17 @@ def expand_evidence(index_dir: Path, buckets: dict[str, list[dict[str, Any]]],
             rel_units = chains_to_units(chains, college_id, cfg)
             have = {u.get("unit_id") for u in units}
             fresh = [u for u in rel_units if u["unit_id"] not in have]
+            if (level or "").lower() == "undergraduate":
+                kept = []
+                for rel in fresh:
+                    detail = rel.get("relation_detail") or {}
+                    if detail.get("entity_type") == "course" and \
+                            course_is_undergraduate(conn, str(detail.get("entity") or "")) is False:
+                        wrong_level.append({"unit_id": rel["unit_id"], "category": code,
+                                            "entity": str(detail.get("entity") or "")})
+                        continue
+                    kept.append(rel)
+                fresh = kept
 
             # Interleave: each relation goes immediately after the unit it hangs off, not in
             # a block at the end. Appended at the end they were never cited once in 62
@@ -624,6 +676,7 @@ def expand_evidence(index_dir: Path, buckets: dict[str, list[dict[str, Any]]],
             out[code] = ordered
             per_cat[code] = len(fresh)
             added_total += len(fresh)
-        return out, {"available": True, "relations_added": added_total, "by_category": per_cat}
+        return out, {"available": True, "relations_added": added_total, "by_category": per_cat,
+                     "wrong_level_dropped": wrong_level}
     finally:
         conn.close()

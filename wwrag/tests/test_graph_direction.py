@@ -8,6 +8,7 @@ Run:
   /Users/chirag/college-intel/.venv-crawl4ai/bin/python -m pytest \
       /Users/chirag/college-intel/wwrag/tests/test_graph_direction.py -q
 """
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -86,3 +87,41 @@ def test_a_small_specialised_school_is_not_a_hub():
     assert not graph.is_hub({"type": "school", "degree": 41}, 104)
     assert not graph.is_hub({"type": "school", "degree": 16}, 104)
     assert graph.is_hub({"type": "university", "degree": 1308}, 104)
+
+
+# --------------------------------------------------------------------------------------
+# a relation about a course inherits the course's level
+# --------------------------------------------------------------------------------------
+
+
+def _units_db(tmp_path):
+    import json as _json
+    db = sqlite3.connect(str(tmp_path / "chunks.sqlite"))
+    db.execute("CREATE TABLE units (unit_id TEXT, kind TEXT, entity_name TEXT, text TEXT, extra TEXT)")
+    db.executemany("INSERT INTO units VALUES (?,?,?,?,?)", [
+        ("c1", "course", "GSBA 511", "GSBA 511: Microeconomics for Management (3 Units)",
+         _json.dumps({"is_undergraduate": 0})),
+        ("c2", "course", "ECON 318", "ECON 318: Introduction to Econometrics (4 Units)",
+         _json.dumps({"is_undergraduate": "true"})),
+        ("c3", "course", "MATH 999", "MATH 999: Mystery", _json.dumps({})),
+    ])
+    db.commit()
+    return db
+
+
+def test_a_relation_naming_a_graduate_course_reads_the_course_flag(tmp_path):
+    from wwrag import graph
+    db = _units_db(tmp_path)
+    assert graph.course_is_undergraduate(db, "GSBA 511 Microeconomics for Management") is False
+    assert graph.course_is_undergraduate(db, "ECON 318 Introduction to Econometrics") is True
+    assert graph.course_is_undergraduate(db, "MATH 999 Mystery") is None, "no flag -> no verdict"
+    assert graph.course_is_undergraduate(db, "Emily Nix") is None
+
+
+def test_a_stated_graduate_audience_is_wrong_for_an_undergraduate():
+    from wwrag import eligibility
+    grad = {"unit_id": "r1", "text": "Writing 540: Writing for Economics Master's Students is offered by Economics."}
+    both = {"unit_id": "r2", "text": "The seminar is open to undergraduate and master's students alike."}
+    assert eligibility.wrong_for_level(grad, "undergraduate") == "graduate_only"
+    assert eligibility.wrong_for_level(both, "undergraduate") is None
+    assert eligibility.wrong_for_level(grad, "graduate") is None
