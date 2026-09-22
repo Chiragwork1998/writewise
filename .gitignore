@@ -1,0 +1,38 @@
+# secrets
+.env
+*.key
+
+# student data -- CVs and generated reports are personal information
+inbox/
+deliverables/
+wwrag/runs/
+
+# crawled pages, indexes and extracts: large, rebuildable, and not ours to redistribute
+colleges/*/pages/
+colleges/*/discovery*/
+colleges/*/extract/
+colleges/*/logs/
+wwrag/index*/
+queues/
+logs_*.log
+
+# vendored third-party
+selfhost/
+
+# python
+__pycache__/
+*.pyc
+.venv*/
+
+# crawled corpus and derived artefacts: large, rebuildable, and not ours to redistribute
+colleges/*/export/
+colleges/*/output/
+colleges/*/guide/
+colleges/*/docs/
+colleges/*/facts*/
+colleges/*/report*/
+.fastembed_cache/
+runs/
+*.zip
+*.sqlite
+*.npy
