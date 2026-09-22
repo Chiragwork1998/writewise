@@ -298,3 +298,22 @@ a different model needs re-measuring. Gap-fill still searches the category's ful
 **Runs.** `wwrag/runs/anchor1/` — Aadya (declared Gender Studies + Economics; PDF published as
 the next `deliverables/Aadya_Aggarwal_USC_v<N>.pdf`) then Aashrut (declared AI, CS, Finance;
 chat review only), launched 18:49.
+
+### 10.1 Same evening — what Aadya's v3 run exposed, and the fixes (commits `f5de5cc`, `f9ac736`, `c37b0a9`)
+
+Aadya v3 (`deliverables/Aadya_Aggarwal_USC_v3.pdf`, 19:17) came out with 9 chapters, and
+Research nearly empty although the writer had produced it. Traced stage by stage:
+
+| Where | What went wrong | Fix |
+|---|---|---|
+| graph step | Relation units are added AFTER the level gate: "Emily Nix teaches GSBA 511" (graduate) reached an undergraduate's Research; "Writing 540 … Master's Students" reached Innovation | A relation naming a course reads that course's own `is_undergraduate` flag and is dropped + logged; the gate now runs after the graph; "for … Master's students" counts as graduate-only unless the text also says undergraduate. Caught "ISE 521" in Aashrut's run minutes later |
+| gap pass | Reserved seats filled with GEN facts (a law-school alumni mentorship, a music-school mentorship) for a "mentor" query in Academics/Intellectual | Gap pass searches only rows that may become the category (support codes excluded). Measured: off 82/88, scoped 86/90, unscoped 88/93 — the surplus was exactly the leak; targets identical |
+| writer gate | "names nothing a reader could look up" knew `Professor X` but not a bare `Mohammed Alyakoob`; binned the Alyakoob item | A cited unit's own entity name, repeated verbatim, is findable |
+| writer | Used 2 of 8 anchors; voice wandered (she / Aadya / you) | Rule 13: one item per ANCHOR unit; rule 14: second person everywhere |
+| verify | Headline it could not quote → replaced by the chapter name ("Emily Nix's Labor and Gender Research" → "Research") | A headline naming a cited thing is kept as a label; a claim-like headline still falls back (existing test kept) |
+| report | Cross-chapter dedupe on headline alone dropped "Gender Studies Major", "Thematic Option", "BA Economics and Data Science" from Research/Intellectual because Academics had them; label-headlines rendered headless | Dedupe key = headline + cited evidence |
+| DeepSeek | Profile call dropped 5×; Quirks chapter dropped 6× ("peer closed connection") | Profile reused from `runs/v4`; Quirks regenerated in v4. Provider failover is the open item (see the model note in chat: keep DeepSeek v4-pro as default, add Claude Sonnet 5 as failover/A-B) |
+
+Tests: 189 passing. Aadya **v4** = the six affected chapters regenerated under the new rules
+(RES, EXT, SOC, QRK, NEW, DIV) + full verify/useful/report; Aashrut ran on the same code
+(chat review, no PDF).
