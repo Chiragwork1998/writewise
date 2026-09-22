@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -56,9 +57,13 @@ CONFIG: dict[str, Any] = {
     "summary_body_chars": 400,   # how much of each section body the summary call sees
     "timeout_s": 300.0,
     "max_attempts": 3,           # 1 try + 2 repair retries, then fail loudly
-    "http_retries": 6,           # transport / 429 / 5xx retries per attempt. Six, not four: the
-                                 # provider drops long responses under load and one dropped chapter
-                                 # kills the whole run after ten minutes of work.
+    # Three, not six: with streaming a transport failure is real, and the fallback model is a
+    # better answer than a fourth sleep. Six retries with exponential backoff cost 105 seconds
+    # of sleep per failing chapter and held a worker slot the whole time.
+    "http_retries": 3,
+    "retry_pause_max": 6,
+    # identical (model, prompt) -> response, on disk. Re-running a stage costs only what changed.
+    "cache_dir": str(Path(__file__).resolve().parent / ".cache" / "calls"),
     "items_min": 1,   # one real item beats two plus filler
     # The brief is a MENU, not the essay. A "Why This College" supplement runs 150-650 words and
     # holds three to five points; the counsellor and the student choose which. So the job is to
@@ -497,6 +502,9 @@ RULES = """RULES (absolute):
    curriculum" is the whole point. (That example is invented: never echo it.) It must be something THIS student can do because of what they have
    already done, and it must be grounded in what the evidence actually says the thing does.
    Null when the evidence describes the thing too thinly to say -- never a vague gesture.
+11b. headline: a LABEL, two to six words, that a reader scans -- "Dr Okafor, marine ecologist",
+   "Repair Cafe Fridays", "ECON 318 Econometrics". Never a sentence, never a citation, never a
+   full title with volume and page numbers. The body carries the detail.
 12. only_you: one sentence naming what in this student's file makes this item theirs. If the
    honest answer is "nothing -- any applicant to this college could be told this", the item
    does not belong in the report. Write that sentence for yourself before you write the
@@ -647,48 +655,113 @@ def render_sections(items: list[dict[str, Any]], names: dict[str, str]) -> str:
 # Model call
 # --------------------------------------------------------------------------------------
 
+def cache_key(model: str, messages: list[dict[str, str]], max_tokens: int) -> str:
+    """One call's identity. A prompt change re-pays only for what changed."""
+    blob = json.dumps([model, messages, max_tokens, CONFIG["temperature"]], sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+def cache_read(key: str) -> tuple[str, dict[str, Any], str] | None:
+    path = Path(CONFIG["cache_dir"]) / f"{key}.json"
+    try:
+        d = json.loads(path.read_text("utf-8"))
+        return d["content"], d.get("usage") or {}, d.get("finish") or ""
+    except Exception:  # noqa: BLE001 - a cache miss is never an error
+        return None
+
+
+def cache_write(key: str, content: str, usage: dict[str, Any], finish: str) -> None:
+    try:
+        d = Path(CONFIG["cache_dir"])
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.json").write_text(
+            json.dumps({"content": content, "usage": usage, "finish": finish}), "utf-8")
+    except Exception:  # noqa: BLE001 - never fail a paid run over a cache write
+        pass
+
+
 def call_model(client: httpx.Client, model: str, messages: list[dict[str, str]],
                label: str, max_tokens: int | None = None) -> tuple[str, dict[str, Any], str]:
-    """POST one completion. Returns (content, usage, finish_reason); retries transport errors."""
+    """POST one completion, STREAMED. Returns (content, usage, finish_reason).
+
+    Streamed, not buffered, and that is the whole difference between a report in four minutes
+    and one in forty. Asked for a long chapter in one buffered response, the provider closed
+    the connection mid-body ("peer closed connection without sending complete message body");
+    every drop then cost six retries and 105 seconds of sleep, and a chapter stuck retrying
+    held a worker slot so the remaining chapters queued behind it. Streaming delivers the same
+    text in pieces that no proxy truncates, and a dead stream is visible immediately.
+
+    Identical calls are served from disk (CONFIG["cache_dir"]), so re-running a stage after a
+    prompt change re-pays only for the chapters whose prompt actually changed.
+    """
     if not any("json" in (m.get("content") or "").lower() for m in messages):
         raise GenerationError(
             f"[{label}] response_format=json_object requires the word 'json' in the prompt"
         )
+    budget = int(max_tokens or CONFIG["max_tokens"])
+    key = cache_key(model, messages, budget)
+    if CONFIG.get("cache_dir"):
+        hit = cache_read(key)
+        if hit is not None:
+            log(f"  [{label}] cache hit")
+            return hit
     payload = {
         "model": model,
         "messages": messages,
         "temperature": CONFIG["temperature"],
-        "max_tokens": int(max_tokens or CONFIG["max_tokens"]),
+        "max_tokens": budget,
         "response_format": {"type": "json_object"},
-        "stream": False,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     last_error: Exception | None = None
     for attempt in range(1, int(CONFIG["http_retries"]) + 1):
         try:
-            response = client.post("/chat/completions", json=payload)
-        except httpx.HTTPError as exc:
+            pieces: list[str] = []
+            usage: dict[str, Any] = {}
+            finish = ""
+            with client.stream("POST", "/chat/completions", json=payload) as response:
+                if response.status_code != 200:
+                    response.read()
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        raise httpx.HTTPError(
+                            f"HTTP {response.status_code}: {response.text[:200]}")
+                    raise GenerationError(
+                        f"[{label}] {model} returned HTTP {response.status_code}: "
+                        f"{response.text[:600]}")
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    body = line[5:].strip()
+                    if body == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(body)
+                    except ValueError:
+                        continue
+                    if obj.get("usage"):
+                        usage = obj["usage"]
+                    for choice in obj.get("choices") or []:
+                        piece = (choice.get("delta") or {}).get("content")
+                        if piece:
+                            pieces.append(piece)
+                        if choice.get("finish_reason"):
+                            finish = choice["finish_reason"]
+        except (httpx.HTTPError, GenerationError) as exc:
+            if isinstance(exc, GenerationError) and "returned HTTP" in str(exc):
+                raise
             last_error = exc
-            pause = min(30, 3 * (2 ** attempt))
-            log(f"  [{label}] transport error ({exc.__class__.__name__}), retry {attempt} in {pause}s")
+            pause = min(int(CONFIG["retry_pause_max"]), 2 * attempt)
+            log(f"  [{label}] stream failed ({exc.__class__.__name__}), retry {attempt} in {pause}s")
             time.sleep(pause)
             continue
-        if response.status_code in (429, 500, 502, 503, 504):
-            last_error = GenerationError(f"HTTP {response.status_code}: {response.text[:300]}")
-            pause = min(30, 3 * (2 ** attempt))
-            log(f"  [{label}] HTTP {response.status_code}, retry {attempt} in {pause}s")
-            time.sleep(pause)
-            continue
-        if response.status_code != 200:
-            raise GenerationError(
-                f"[{label}] {model} returned HTTP {response.status_code}: {response.text[:600]}"
-            )
-        data = response.json()
-        choice = (data.get("choices") or [{}])[0]
-        finish = choice.get("finish_reason") or ""
-        content = (choice.get("message") or {}).get("content") or ""
+        content = "".join(pieces)
         if not content and finish != "length":
-            raise GenerationError(f"[{label}] {model} returned an empty message")
-        usage = data.get("usage") or {}
+            last_error = GenerationError("empty stream")
+            log(f"  [{label}] empty stream, retry {attempt}")
+            continue
+        if CONFIG.get("cache_dir"):
+            cache_write(key, content, usage, finish)
         return content, usage, finish
     raise GenerationError(f"[{label}] {model} unreachable after retries: {last_error}")
 

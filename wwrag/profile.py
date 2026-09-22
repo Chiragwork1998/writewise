@@ -819,12 +819,54 @@ def call_model(resume_text: str, model: str, api_key: str, base_url: str) -> dic
     }
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    # STREAMED, and cached on the resume's own text. One buffered reasoning-model response is
+    # exactly the shape this provider drops ("peer closed connection without sending complete
+    # message body"): five drops cost twelve minutes on one run. Streaming cannot be truncated
+    # the same way, and an unchanged CV is then free and instant on every later run.
+    payload["stream"] = True
+    payload["stream_options"] = {"include_usage": True}
+    cache_dir = Path(__file__).resolve().parent / ".cache" / "profile"
+    key = hashlib.sha256(
+        json.dumps([model, payload["messages"], CONFIG["temperature"]], sort_keys=True)
+        .encode("utf-8")).hexdigest()[:32]
+    cached = cache_dir / f"{key}.json"
+    try:
+        parsed = json.loads(cached.read_text("utf-8"))
+        if isinstance(parsed, dict):
+            print("    profile: cache hit (identical resume and model)", flush=True)
+            return parsed
+    except Exception:  # noqa: BLE001 - a cache miss is never an error
+        pass
+
     last = None
     for attempt in range(CONFIG["max_retries"]):
         try:
-            response = httpx.post(url, headers=headers, json=payload, timeout=CONFIG["timeout_s"])
-            if response.status_code == 200:
-                body = response.json()
+            with httpx.stream("POST", url, headers=headers, json=payload,
+                              timeout=CONFIG["timeout_s"]) as response:
+                if response.status_code == 200:
+                    pieces, usage = [], {}
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        chunk = line[5:].strip()
+                        if chunk == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(chunk)
+                        except ValueError:
+                            continue
+                        if obj.get("usage"):
+                            usage = obj["usage"]
+                        for choice in obj.get("choices") or []:
+                            piece = (choice.get("delta") or {}).get("content")
+                            if piece:
+                                pieces.append(piece)
+                    body = {"choices": [{"message": {"content": "".join(pieces)}}], "usage": usage}
+                else:
+                    response.read()
+                    body = None
+            if body is not None:
                 USAGE_LEDGER.append({
                     "call": "extract_profile",
                     "model": model,
@@ -837,6 +879,11 @@ def call_model(resume_text: str, model: str, api_key: str, base_url: str) -> dic
                     raise RuntimeError(f"model returned non-JSON content: {exc}: {content[:400]!r}") from exc
                 if not isinstance(parsed, dict):
                     raise RuntimeError(f"model returned {type(parsed).__name__}, expected a JSON object")
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    cached.write_text(json.dumps(parsed), "utf-8")
+                except Exception:  # noqa: BLE001 - never fail a paid run over a cache write
+                    pass
                 return parsed
             if response.status_code in (408, 409, 429) or response.status_code >= 500:
                 last = f"HTTP {response.status_code}: {response.text[:300]}"
@@ -847,7 +894,7 @@ def call_model(resume_text: str, model: str, api_key: str, base_url: str) -> dic
         # Long enough for the provider to recover from dropping a response under load, short
         # enough that a run does not sit silently for twelve minutes before admitting defeat.
         # And say so: a retry ladder nobody can see looks identical to a hung process.
-        pause = min(30, 3 * (2 ** attempt))
+        pause = min(6, 2 * (attempt + 1))
         print(f"  retry {attempt + 1}/{CONFIG['max_retries']} in {pause}s -- {last}",
               file=sys.stderr, flush=True)
         time.sleep(pause)

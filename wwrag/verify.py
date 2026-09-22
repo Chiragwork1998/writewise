@@ -56,7 +56,7 @@ CONFIG: dict[str, Any] = {
     "verifier_model": "deepseek-flash",
     "temperature": 0.0,
     "batch_size": 6,
-    "max_workers": 4,
+    "max_workers": 8,   # string checks are IO-bound; 4 was leaving the provider idle
     "request_timeout": 180.0,
     "max_retries": 4,
     "min_quote_chars": 3,
@@ -1050,21 +1050,46 @@ def make_model_caller(api_key: str, api_base: str, model: str, timeout: float,
                 {"role": "user", "content": user},
             ],
         }
+        # streamed: the provider truncates buffered bodies under load, and a truncated batch
+        # of claim verdicts reads as "unsupported" and deletes good sentences
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
         last: Exception | None = None
         for attempt in range(max_retries):
             try:
-                response = client.post(url, json=payload)
-                if response.status_code in (429, 500, 502, 503, 504):
-                    raise RuntimeError(f"{model}: HTTP {response.status_code}: {response.text[:200]}")
-                response.raise_for_status()
-                body = response.json()
+                pieces: list[str] = []
+                usage: dict[str, Any] = {}
+                with client.stream("POST", url, json=payload) as response:
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        response.read()
+                        raise RuntimeError(
+                            f"{model}: HTTP {response.status_code}: {response.text[:200]}")
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        chunk = line[5:].strip()
+                        if chunk == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(chunk)
+                        except ValueError:
+                            continue
+                        if obj.get("usage"):
+                            usage = obj["usage"]
+                        for choice in obj.get("choices") or []:
+                            piece = (choice.get("delta") or {}).get("content")
+                            if piece:
+                                pieces.append(piece)
                 with _USAGE_LOCK:
-                    USAGE_LEDGER.append({"model": model, "usage": body.get("usage") or {}})
-                return body["choices"][0]["message"]["content"]
+                    USAGE_LEDGER.append({"model": model, "usage": usage})
+                if not "".join(pieces).strip():
+                    raise RuntimeError(f"{model}: empty stream")
+                return "".join(pieces)
             except Exception as exc:  # noqa: BLE001 - retried, then re-raised
                 last = exc
                 if attempt < max_retries - 1:
-                    time.sleep(2.0 * (2 ** attempt))
+                    time.sleep(min(6.0, 2.0 * (attempt + 1)))
         raise RuntimeError(f"model call failed after {max_retries} attempts: {last}")
 
     return call
@@ -1433,7 +1458,12 @@ def rebuild_report(items: Sequence[dict], records: Sequence[dict], profile: dict
         # "Intellectual Alignment" away. A headline that is a claim of its own ("Ranked #1 for
         # robotics nationwide") still falls back to the chapter label.
         if rebuilt.get("headline"):
-            new_item["headline"] = rebuilt["headline"]
+            # a headline is a label. The repair pass "corrects" it toward the quote it came
+            # from, which turned "Stephanie Tully's consumer research" into the paper's full
+            # title with volume and page numbers. Keep the writer's label when the repair grew.
+            written = str(item.get("headline") or "").strip()
+            fixed = str(rebuilt["headline"]).strip()
+            new_item["headline"] = written if (written and len(fixed) > max(60, 2 * len(written))) else fixed
             head = next((r for r in mine if r["field"] == "headline"), None)
             actions["headline_action"] = "corrected" if head and head["status"] == "corrected" else "kept"
         elif headline_names_cited_thing(item, evidence):

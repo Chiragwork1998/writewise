@@ -574,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated majors the student has declared, e.g. 'Gender Studies, Economics'",
     )
     parser.add_argument(
-        "--concurrency", type=int, default=8,
+        "--concurrency", type=int, default=10,
         help="chapters written at once. Measured on a real run: 3 took 762s and 8 took 276s for "
              "the same output at the same price, because the bill is per token, not per second.",
     )
