@@ -1358,7 +1358,7 @@ def verify_report(
             "reason": record["reason"],
         })
 
-    cleaned, item_ledger = rebuild_report(items, records, profile, cfg)
+    cleaned, item_ledger = rebuild_report(items, records, profile, cfg, evidence)
     if model_fn is None:
         # deletion above is what protects the reader; this only makes the mode legible to
         # anyone who opens the artifacts, since a renderer never sees the ledger
@@ -1368,8 +1368,25 @@ def verify_report(
     return {"claims": verified, "report": cleaned, "ledger": ledger}
 
 
+def headline_names_cited_thing(item: dict, evidence: dict[str, dict] | None) -> bool:
+    """True when the headline repeats the name of a thing the item cites -- a professor, a
+    club, a course. Such a headline is a label for verified evidence, not a claim of its own."""
+    if not evidence:
+        return False
+    head = normalise(str(item.get("headline") or ""))
+    if not head:
+        return False
+    for uid in item.get("evidence_ids") or []:
+        unit = evidence.get(str(uid)) or {}
+        name = normalise(str(unit.get("entity_name") or ""))
+        if name and len(name) >= 3 and name in head:
+            return True
+    return False
+
+
 def rebuild_report(items: Sequence[dict], records: Sequence[dict], profile: dict,
-                   cfg: dict[str, Any]) -> tuple[list[dict], list[dict]]:
+                   cfg: dict[str, Any], evidence: dict[str, dict] | None = None
+                   ) -> tuple[list[dict], list[dict]]:
     """Reassemble items from surviving claims only; drop items with nothing left."""
     by_item: dict[tuple[str, int], list[dict]] = {}
     for record in records:
@@ -1410,11 +1427,18 @@ def rebuild_report(items: Sequence[dict], records: Sequence[dict], profile: dict
             rebuilt[field] = "".join(chunks).strip()
 
         new_item = dict(item)
-        # headline: an unsupported headline falls back to the plain category label
+        # headline: when no quote supports it verbatim, keep it if it is a LABEL naming a thing
+        # the item cites (a professor, a club, a course) -- "Emily Nix's Labor and Gender
+        # Research" became "Research", the report rendered it headless and deduped a second
+        # "Intellectual Alignment" away. A headline that is a claim of its own ("Ranked #1 for
+        # robotics nationwide") still falls back to the chapter label.
         if rebuilt.get("headline"):
             new_item["headline"] = rebuilt["headline"]
             head = next((r for r in mine if r["field"] == "headline"), None)
             actions["headline_action"] = "corrected" if head and head["status"] == "corrected" else "kept"
+        elif headline_names_cited_thing(item, evidence):
+            new_item["headline"] = str(item["headline"]).strip()
+            actions["headline_action"] = "kept_as_label"
         else:
             new_item["headline"] = cfg["categories"].get(code, code)
             actions["headline_action"] = "replaced_with_category_label"

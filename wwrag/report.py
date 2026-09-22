@@ -804,7 +804,11 @@ def build_markdown(report_items, report_meta, units, profile, college, categorie
         cites = new_cites(slug)
         pieces = []
         for it in by_code.get(code, []):
+            # the same THING from the same evidence is a duplicate; the same thing seen from
+            # another chapter's angle, on other evidence, is not (a major is an academic fact
+            # in Academics and an intellectual home in Intellectual Alignment)
             key = _WS.sub(" ", str(it.get("headline") or "")).strip().casefold()
+            key = key + "|" + ",".join(sorted(str(e) for e in (it.get("evidence_ids") or []))) if key else key
             if key and key in seen_headlines:
                 stats["duplicate_items"] = stats.get("duplicate_items", 0) + 1
                 note("item %r already appeared in an earlier chapter; dropped" % it.get("headline"))

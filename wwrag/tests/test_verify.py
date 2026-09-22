@@ -386,6 +386,19 @@ def test_unsupported_headline_falls_back_to_the_category_label():
     assert result["ledger"]["items"][0]["headline_action"] == "replaced_with_category_label"
 
 
+def test_a_headline_that_names_the_cited_thing_is_kept_as_a_label():
+    """'Emily Nix's Labor and Gender Research' is a label for verified evidence about Emily
+    Nix, not a claim; replacing it with 'Research' made the report render the item headless."""
+    items = [_item(
+        "EXT", "Robotics Club's rover programme",
+        "The Robotics Club builds autonomous rovers.",
+        evidence_ids=["u-fact-robotics"],
+    )]
+    result = run(items)
+    assert result["report"][0]["headline"] == "Robotics Club's rover programme"
+    assert result["ledger"]["items"][0]["headline_action"] in ("kept", "kept_as_label")
+
+
 def test_item_with_nothing_verifiable_is_dropped_entirely():
     items = [
         _item("EXT", "Rovers", "The Robotics Club builds autonomous rovers.",
